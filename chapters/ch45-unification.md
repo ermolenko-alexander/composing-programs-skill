@@ -1,71 +1,171 @@
 # Section 4.5: Unification
 
 ## Core Idea
-The query interpreter's entire power reduces to one primitive — unification, matching two expressions that may both contain variables — applied repeatedly by a depth-limited recursive search over facts. The logic language is a prover: facts are axioms, queries are assertions to establish.
+This section implements the query interpreter that performs inference in the `logic` language. The interpreter is a **general problem solver**, but with substantial limitations on the scale and type of problems it can solve; the construction of efficient inference procedures remains an active research topic. The fundamental operation is **unification**: a general method of matching a query to a fact, each of which may contain variables. The interpreter applies this operation repeatedly — first to match the original query to conclusions of facts, then to match the hypotheses of facts to other conclusions in the database — performing a search through the space of all facts related to a query. If it finds a way to support the query with an assignment of values to variables, it returns that assignment as a successful result.
 
-## Frameworks Introduced
-- **Pattern matching**: a pattern matches an expression (a possibly nested Scheme list) if some binding of variables to values makes substitution into the pattern yield the expression. E.g. `((a b) c (a b))` matches `(?x c ?x)` with `?x` bound to `(a b)`.
-- **The unification algorithm**: generalizes pattern matching to two expressions that both contain variables. Recursive conditions, in order:
-  1. Replace `e` and `f` by their values if they are bound variables (lookup).
-  2. If `e == f`, succeed.
-  3. If `e` is a variable, bind `e` to `f` and succeed; symmetrically for `f`.
-  4. If neither is a variable and either is an atom (and they are unequal), fail.
-  5. Otherwise both are pairs: unify first with first and second with second.
-- **Proofs**: each fact is an axiom; a query asserts there exists an assignment making all sub-expressions follow from the axioms; each returned assignment is a trace of a proof.
-- **Search procedure**: the recursive, generator-based `search(clauses, env, depth)` chooses which expressions to unify, chaining facts; it yields environments of successful bindings and limits nesting by `DEPTH_LIMIT`.
-- **Unique names (rename_variables)**: before unifying with a fact, rename its variables with a unique integer suffix (`?x` → `?x_7`) so an `?x` in one fact is never confused with `?x` in another.
+## Formal Rules
+
+### Pattern matching
+A pattern matches some expression (a possibly nested Scheme list) if there is a binding of variable names to values such that substituting those values into the pattern yields the expression. E.g. `((a b) c (a b))` matches `(?x c ?x)` with `?x` bound to `(a b)`; the same expression matches `((a ?y) ?z (a b))` with `?y` → `b`, `?z` → `c`.
+
+### The unification algorithm — conditions checked in order
+Unification generalizes pattern matching to two expressions that may *both* contain variables, recursing on corresponding parts until a contradiction is reached or a viable binding to all variables is established:
+1. Both inputs `e` and `f` are replaced by their values if they are (bound) variables.
+2. If `e` and `f` are equal, unification succeeds.
+3. If `e` is a variable, unification succeeds and `e` is bound to `f`.
+4. If `f` is a variable, unification succeeds and `f` is bound to `e`.
+5. If neither is a variable, both are not lists, and they are not equal, then `e` and `f` cannot be unified — failure.
+6. Otherwise both are pairs: unification is performed on both their first and second corresponding elements.
+
+```python
+>>> def unify(e, f, env):
+        """Destructively extend ENV so as to unify (make equal) e and f, returning
+        True if this succeeds and False otherwise.  ENV may be modified in either
+        case (its existing bindings are never changed)."""
+        e = lookup(e, env)
+        f = lookup(f, env)
+        if e == f:
+            return True
+        elif isvar(e):
+            env.define(e, f)
+            return True
+        elif isvar(f):
+            env.define(f, e)
+            return True
+        elif scheme_atomp(e) or scheme_atomp(f):
+            return False
+        else:
+            return unify(e.first, f.first, env) and unify(e.second, f.second, env)
+```
+
+### Representation
+Facts and queries are Scheme lists using the `Pair` class and `nil` object from the previous chapter: `read_line("(?x c ?x)")` → `Pair('?x', Pair('c', Pair('?x', nil)))`. An environment binding symbols to values is a `Frame` instance with a `bindings` attribute. Replicable via `from logic import *`.
+
+### Unique names
+Unification assumes no variable is shared between `e` and `f`. But facts and queries reuse names — an `?x` in one fact is unrelated to `?x` in another. Before a fact is passed to `unify`, its variable names are replaced by unique names via `rename_variables`, appending a unique integer for the fact:
+```python
+>>> def rename_variables(expr, n):
+        """Rename all variables in EXPR with an identifier N."""
+        if isvar(expr):
+            return expr + '_' + str(n)
+        elif scheme_pairp(expr):
+            return Pair(rename_variables(expr.first, n),
+                        rename_variables(expr.second, n))
+        else:
+            return expr
+```
+
+## Worked Examples
+
+### 1. Basic pattern match with `unify`
+```python
+>>> e = read_line("((a b) c (a b))")
+>>> f = read_line("(?x c ?x)")
+>>> env = Frame(None)
+>>> unify(e, f, env)
+True
+>>> env.bindings
+{'?x': Pair('a', Pair('b', nil))}
+>>> print(env.lookup('?x'))
+(a b)
+```
+True means the pattern `f` matched the expression `e`; the result is recorded as the binding of `?x` to `(a b)`.
+
+### 2. Two-sided unification trace: `(?x ?x)` vs `((a ?y c) (a b ?z))`
+These unify because an expression with no variables matches both: `((a b c) (a b c))`. Steps:
+1. To match the first elements, bind `?x` to `(a ?y c)`.
+2. To match the second elements, first replace `?x` by its value; then match `(a ?y c)` to `(a b ?z)` by binding `?y` → `b` and `?z` → `c`.
+```python
+>>> e = read_line("(?x ?x)")
+>>> f = read_line("((a ?y c) (a b ?z))")
+>>> env = Frame(None)
+>>> unify(e, f, env)
+True
+>>> env.bindings
+{'?z': 'c', '?y': 'b', '?x': Pair('a', Pair('?y', Pair('c', nil)))}
+>>> print(bind(e, env))
+((a b c) (a b c))
+```
+Note `?x` is bound to an expression that **itself contains a variable**. The `bind` function recursively and repeatedly substitutes all variables by their values in an expression until no bound variables remain.
+
+### 3. Proof as a query result
+"One way to think about the `logic` language is as a prover of assertions in a formal system. Each stated fact establishes an axiom, and each query must be established by the query interpreter from these axioms" — each query asserts there is some assignment to its variables such that all sub-expressions simultaneously follow from the facts. Given the dog-genealogy facts (parents, the two `ancestor` rules, and `dog`/`color` records), assert there is a common ancestor of clinton and a brown dog:
+```scheme
+(query (ancestor ?a clinton)
+       (ancestor ?a ?brown-dog)
+       (dog (name ?brown-dog) (color brown)))
+```
+The interpreter outputs `Success!` only if it can establish the assertion; each returned assignment is a **trace of a larger proof** (a full proof would include all facts used, e.g. `(parent abraham clinton)` and `(parent fillmore abraham)`).
+
+## The Search Procedure
+Unification is the primitive; the **search procedure** chooses what expressions to unify so that a set of facts chains together to establish the query. `search` takes the Scheme list of query `clauses`, an environment `env` of current bindings (initially empty), and the `depth` of rules chained so far:
+
+```python
+>>> def search(clauses, env, depth):
+        """Search for an application of rules to establish all the CLAUSES,
+        non-destructively extending the unifier ENV.  Limit the search to
+        the nested application of DEPTH rules."""
+        if clauses is nil:
+            yield env
+        elif DEPTH_LIMIT is None or depth <= DEPTH_LIMIT:
+            if clauses.first.first in ('not', '~'):
+                clause = ground(clauses.first.second, env)
+                try:
+                    next(search(clause, glob, 0))
+                except StopIteration:
+                    env_head = Frame(env)
+                    for result in search(clauses.second, env_head, depth+1):
+                        yield result
+            else:
+                for fact in facts:
+                    fact = rename_variables(fact, get_unique_id())
+                    env_head = Frame(env)
+                    if unify(fact.first, clauses.first, env_head):
+                        for env_rule in search(fact.second, env_head, depth+1):
+                            for result in search(clauses.second, env_rule, depth+1):
+                                yield result
+```
+
+Execution logic, as the text explains it:
+- Empty clauses → yield the environment: a solution.
+- **Negated first clause**: rather than unifying it with a fact, check that *no* unification is possible via a recursive `search` on the grounded clause (`ground` substitutes current env values). If that recursive call yields nothing (`StopIteration`), continue with the rest of the clauses; if unification is possible, fail immediately.
+- **Ordinary first clause**: for each fact in the database, rename its variables with a unique id, then attempt to unify the fact's conclusion (`fact.first`) with the query's first clause in a **new child environment** `env_head` (bindings happen as a side effect). On success:
+  - the middle `for` establishes the **hypotheses of the rule** (`fact.second`) — this is where a recursive rule's hypotheses are passed recursively to `search`;
+  - for every environment `env_rule` that establishes them, the final `for` searches to establish the **rest of the query's clauses**; every success is yielded.
+- `DEPTH_LIMIT` caps the nested application of rules, keeping the search finite.
 
 ## Key Concepts
-- **Unification**: the general method of matching a query to a fact where both may contain variables.
-- **Frame / env**: an environment of variable bindings; unification "destructively extends" it, but existing bindings are never changed.
-- **bind**: recursively substitutes bound variables into an expression until none remain (e.g. producing `((a b c) (a b c))`).
-- **Ground**: a clause with its variables substituted by current env values (used for negation).
-- **Negation as failure in search**: for a `not` clause, run a sub-search; if it yields nothing, continue with remaining clauses; if it yields anything, fail immediately.
-- **DEPTH_LIMIT**: a cap on the nested application of rules, keeping search finite.
-- **Generator-based search**: `search` is a Python generator; each `yield env` is one solution, so results stream lazily.
+- **Unification**: matching two expressions that may both contain variables.
+- **Frame / env**: binding environment; `unify` "destructively extends" it, but **existing bindings are never changed** (env may be modified even on failure).
+- **lookup**: replace a bound variable by its value before comparing.
+- **bind**: substitute variables transitively until none remain.
+- **ground**: a clause with variables replaced by current env values (used for negation).
+- **rename_variables / get_unique_id**: `?x` → `?x_7`, per fact, so unrelated variables never collide.
+- **search**: a Python generator — each `yield env` streams one solution lazily.
+- **DEPTH_LIMIT**: termination at the price of completeness.
+- **Proof trace**: each successful assignment witnesses a proof of the query from the axioms.
 
 ## Mental Models
-- Think of unification as two-way pattern matching: either side may contribute the variables, and a variable can bind to an expression that itself contains variables (`?x` → `(a ?y c)`), resolved later by `bind`.
-- Think of the interpreter's apparent "intelligence" as one simple operation repeated: unify query clause with a fact's conclusion, then recursively establish the fact's hypotheses, then the rest of the query clauses.
-- Think of each successful search result as a proof trace in a formal system.
+- Unification is two-way pattern matching: either side may contribute variables, and a variable may bind to an expression containing variables, resolved later by `bind`.
+- The interpreter's apparent intelligence is one operation repeated: unify a query clause with a fact's conclusion, recursively establish the fact's hypotheses, then the remaining query clauses.
+- The nested `for`/`yield` structure is a lazy depth-first search over proof trees; child `Frame`s make it non-destructive per branch.
 
-## Anti-patterns
-- **Sharing variable names across facts**: unification assumes no variable is shared between the two expressions; without `rename_variables`, unrelated `?x`s collide.
-- **Unbounded recursive rules**: recursive facts can chain forever; the depth limit is what keeps the solver from diverging (and also limits what it can prove).
-
-## Code Examples
-```python
-def unify(e, f, env):
-    """Destructively extend ENV so as to unify (make equal) e and f."""
-    e = lookup(e, env)
-    f = lookup(f, env)
-    if e == f:
-        return True
-    elif isvar(e):
-        env.define(e, f)
-        return True
-    elif isvar(f):
-        env.define(f, e)
-        return True
-    elif scheme_atomp(e) or scheme_atomp(f):
-        return False
-    else:
-        return unify(e.first, f.first, env) and unify(e.second, f.second, env)
-```
-- **What it demonstrates**: the complete unification algorithm — lookup, equality, variable binding, atom failure, recursive descent on pairs.
-
-## Worked Example
-Unifying `(?x ?x)` with `((a ?y c) (a b ?z))`. Step 1: match first elements — bind `?x` to `(a ?y c)`. Step 2: match second elements — replace `?x` by its value, then unify `(a ?y c)` with `(a b ?z)`, binding `?y`→`b` and `?z`→`c`. The env now holds all three bindings, and `bind(e, env)` prints `((a b c) (a b c))` — the variable-free expression that matches both patterns. On top of this, `search` proves compound queries: it renames a fact's variables, unifies the fact's conclusion with the query's first clause in a child Frame, recursively establishes the fact's hypotheses, then recursively establishes the remaining query clauses, yielding every environment that succeeds — e.g. finding a common ancestor of clinton and a brown dog from the dog-genealogy facts.
+## Anti-patterns / Common Errors
+- **Sharing variable names across facts**: without `rename_variables`, an `?x` in one fact gets confused with the unrelated `?x` in another — bindings collide and wrong proofs appear.
+- **Unbounded recursive rules**: recursive facts can chain forever; the depth limit is what keeps the solver from diverging, and also limits what it can prove.
+- **Assuming env is untouched on failure**: `unify` may modify the environment either way — only *existing* bindings are safe; this is why each attempt gets a fresh child `Frame(env)`.
+- **Expecting full-strength logic**: this is a simple general problem solver; efficient inference is open research, and the implementation trades completeness for termination.
 
 ## Key Takeaways
-1. Unification = pattern matching where both sides may hold variables; five ordered cases implement it.
+1. Unification = pattern matching where both sides may hold variables; six ordered conditions implement it (lookup, equality, bind-e, bind-f, atom failure, recurse on pairs).
 2. Bindings may be partial (variable → expression with variables); `bind` resolves them transitively.
-3. Inference = unify conclusion, then recursively establish hypotheses, then remaining clauses — a nested generator search.
-4. Rename fact variables with unique ids before each unification.
-5. Negation is implemented as a failing sub-search; it grounds the clause first.
-6. A depth limit makes the general problem solver terminate, at the cost of completeness; efficient inference remains an open research topic.
+3. Inference = unify conclusion, then recursively establish hypotheses, then remaining clauses — a nested generator search over child frames.
+4. Rename fact variables with unique integer suffixes before each unification.
+5. Negation = a failing grounded sub-search; success of the inner search fails the `not` immediately.
+6. A depth limit makes the solver terminate at the cost of completeness.
+7. A query result is a proof trace: facts are axioms, the interpreter is a prover.
 
 ## Connects To
-- **Section 4.4**: implements the logic language whose facts/queries it proves.
-- **Section 4.2**: `search` is a generator — solutions are produced lazily via `yield`.
-- **Chapter 3**: expressions are `Pair`/`nil` Scheme lists and `Frame` environments from the Scheme interpreter.
+- **Section 4.4**: implements the logic language whose facts and queries it proves (dog genealogy reused as the axiom set).
+- **Section 4.2**: `search` is a generator — solutions stream lazily via `yield`; `StopIteration` signals a failed sub-search.
+- **Chapter 3**: expressions are `Pair`/`nil` Scheme lists; environments are `Frame`s from the Scheme interpreter project.
